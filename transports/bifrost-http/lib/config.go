@@ -195,10 +195,43 @@ type ConfigData struct {
 	Plugins           []*schemas.PluginConfig               `json:"plugins,omitempty"`
 	WebSocket         *schemas.WebSocketConfig              `json:"websocket,omitempty"`
 	FeatureFlags      *FeatureFlagsFileConfig               `json:"feature_flags,omitempty"`
+	ConfigSync        *ConfigSyncConfig                     `json:"config_sync,omitempty"`
 
 	presentSections           map[string]bool
 	presentGovernanceSections map[string]bool
 	SkillsRegistry            *SkillsRegistryConfig `json:"skills_registry,omitempty"`
+}
+
+// ConfigSyncConfig enables the periodic DB-to-memory reconcile worker for
+// multi-node OSS deployments (enterprise builds converge via cluster gossip
+// instead). Disabled unless Enabled is explicitly true; interval defaults to
+// DefaultConfigSyncInterval when unset. Startup-read only: changing the block
+// requires a restart, like other file-level knobs.
+type ConfigSyncConfig struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	IntervalSeconds *int  `json:"interval_seconds,omitempty"`
+}
+
+// DefaultConfigSyncInterval is the reconcile period used when config_sync is
+// enabled without an explicit interval_seconds.
+const DefaultConfigSyncInterval = 30 * time.Second
+
+// IsEnabled reports whether the worker should run.
+func (c *ConfigSyncConfig) IsEnabled() bool {
+	return c != nil && c.Enabled != nil && *c.Enabled
+}
+
+// IntervalOrDefault returns the configured interval, or the default when unset
+// or out of range.
+func (c *ConfigSyncConfig) IntervalOrDefault() time.Duration {
+	if c == nil || c.IntervalSeconds == nil {
+		return DefaultConfigSyncInterval
+	}
+	seconds := *c.IntervalSeconds
+	if seconds <= 0 {
+		return DefaultConfigSyncInterval
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // SkillsRegistryConfig defines declarative skill definitions in config.json.
@@ -453,6 +486,7 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 		Plugins           []*schemas.PluginConfig               `json:"plugins,omitempty"`
 		WebSocket         *schemas.WebSocketConfig              `json:"websocket,omitempty"`
 		FeatureFlags      *FeatureFlagsFileConfig               `json:"feature_flags,omitempty"`
+		ConfigSync        *ConfigSyncConfig                     `json:"config_sync,omitempty"`
 		SkillsRegistry    *SkillsRegistryConfig                 `json:"skills_registry,omitempty"`
 	}
 
@@ -477,6 +511,7 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 	cd.Plugins = temp.Plugins
 	cd.WebSocket = temp.WebSocket
 	cd.FeatureFlags = temp.FeatureFlags
+	cd.ConfigSync = temp.ConfigSync
 	cd.presentGovernanceSections = nil
 	if rawGovernance, ok := raw["governance"]; ok && len(rawGovernance) > 0 {
 		var rawGovernanceFields map[string]json.RawMessage
@@ -580,6 +615,16 @@ type Config struct {
 	// ConfigData.SetupToken / resolveSetupToken). Empty when the operator hasn't
 	// configured one. Never persisted — read fresh from config/env on every boot.
 	SetupToken string
+
+	// ConfigSync holds the resolved config_sync block from config.json. Nil or
+	// disabled means the periodic DB→memory reconcile worker stays off — see
+	// server/configsync.go.
+	ConfigSync *ConfigSyncConfig
+
+	// configJSONSourceOfTruth records source_of_truth=config.json from
+	// config.json so runtime components can avoid fighting the file→DB
+	// authoritative sync. Periodic DB→memory reconcile is skipped in that mode.
+	configJSONSourceOfTruth bool
 
 	// webhookEndpoints serves webhook endpoint config to the request path and
 	// the delivery worker without database reads. Guarded by muWebhooks;
@@ -951,6 +996,10 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 	initVault(&configData)
 	// 1b. Bootstrap setup token (from config file or BIFROST_SETUP_TOKEN env var)
 	config.SetupToken = resolveSetupToken(&configData)
+	// 1c. Config sync block + source-of-truth mode — startup-read only, so the
+	// server can gate the reconcile worker on them during Bootstrap.
+	config.ConfigSync = configData.ConfigSync
+	config.configJSONSourceOfTruth = configData.isConfigJSONSourceOfTruth()
 	// 2. Stores (config, logs, vector) — creates defaults for absent configs
 	if err := initStores(ctx, config, &configData, configDBPath, logsDBPath); err != nil {
 		return nil, err
@@ -5023,22 +5072,22 @@ func ResolveFrameworkPricingConfig(
 	}
 
 	return &configstoreTables.TableFrameworkConfig{
-			ID:                     configID,
-			PricingURL:             resolvedPricingURL,
-			PricingSyncInterval:    resolvedSyncSeconds,
-			ModelParametersURL:     resolvedModelParametersURL,
-			MCPLibraryURL:          resolvedMCPLibraryURL,
-			MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
-			LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
-			ConfigHash:             persistedHash,
-		}, &modelcatalog.Config{
-			PricingURL:             resolvedPricingURL,
-			PricingSyncInterval:    resolvedSyncSeconds,
-			ModelParametersURL:     resolvedModelParametersURL,
-			MCPLibraryURL:          resolvedMCPLibraryURL,
-			MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
-			LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
-		}, needsDBUpdate
+		ID:                     configID,
+		PricingURL:             resolvedPricingURL,
+		PricingSyncInterval:    resolvedSyncSeconds,
+		ModelParametersURL:     resolvedModelParametersURL,
+		MCPLibraryURL:          resolvedMCPLibraryURL,
+		MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
+		LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
+		ConfigHash:             persistedHash,
+	}, &modelcatalog.Config{
+		PricingURL:             resolvedPricingURL,
+		PricingSyncInterval:    resolvedSyncSeconds,
+		ModelParametersURL:     resolvedModelParametersURL,
+		MCPLibraryURL:          resolvedMCPLibraryURL,
+		MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
+		LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
+	}, needsDBUpdate
 }
 
 // initFrameworkConfig initializes framework config and pricing manager from file
@@ -5359,6 +5408,13 @@ func (c *Config) GetRawConfigString() string {
 //   - Thread-safe with read locks for concurrent access
 //
 // Returns a copy of the configuration to prevent external modifications.
+// IsConfigJSONSourceOfTruth reports whether config.json sections own
+// reconciliation for this process (source_of_truth=config.json). Periodic
+// DB→memory reconcile is skipped in that mode — see server/configsync.go.
+func (c *Config) IsConfigJSONSourceOfTruth() bool {
+	return c.configJSONSourceOfTruth
+}
+
 func (c *Config) GetProviderConfigRaw(provider schemas.ModelProvider) (*configstore.ProviderConfig, error) {
 	c.Mu.RLock()
 	defer c.Mu.RUnlock()

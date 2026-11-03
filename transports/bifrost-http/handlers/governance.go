@@ -1890,16 +1890,26 @@ func (h *GovernanceHandler) mutateVirtualKeyBudgetOverride(ctx *fasthttp.Request
 
 	// IsCalendarAligned was stamped onto the budget by the virtual key's AfterFind
 	// during loadVirtualKeyBudget, and the store needs it to anchor a finite grant
-	// on the same lattice the budget actually resets on.
-	budget, err = h.configStore.UpdateBudgetOverride(
-		ctx,
-		budget.ID,
-		budget.OverrideAmount,
-		budget.OverrideMode,
-		budget.OverrideCyclesRemaining,
-		budget.IsCalendarAligned,
-	)
-	if err != nil {
+	// on the same lattice the budget actually resets on. The owning VK row's
+	// updated_at is bumped in the same transaction so VK-row change detection
+	// (multi-node config sync) observes the override — the budget row alone is
+	// invisible to it (usage dumps bump it constantly).
+	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
+		var updateErr error
+		budget, updateErr = h.configStore.UpdateBudgetOverride(
+			ctx,
+			budget.ID,
+			budget.OverrideAmount,
+			budget.OverrideMode,
+			budget.OverrideCyclesRemaining,
+			budget.IsCalendarAligned,
+			tx,
+		)
+		if updateErr != nil {
+			return updateErr
+		}
+		return touchVirtualKeyTx(tx, vkID)
+	}); err != nil {
 		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, "budget not found")
 			return
@@ -1917,6 +1927,17 @@ func (h *GovernanceHandler) mutateVirtualKeyBudgetOverride(ctx *fasthttp.Request
 		Budget:            budget,
 		EffectiveMaxLimit: budget.EffectiveMaxLimit(),
 	})
+}
+
+// touchVirtualKeyTx bumps the virtual key row's updated_at inside an existing
+// transaction. VK-scoped child writes (budget overrides, VK-scoped model
+// configs) land on child rows only; the config sync worker's VK probe watches
+// the VK row itself, so child-only writes must touch the parent row to stay
+// visible to peer nodes.
+func touchVirtualKeyTx(tx *gorm.DB, vkID string) error {
+	return tx.Model(&configstoreTables.TableVirtualKey{}).
+		Where("id = ?", vkID).
+		Update("updated_at", time.Now()).Error
 }
 
 // updateVirtualKey handles PUT /api/governance/virtual-keys/{vk_id} - Update a virtual key
@@ -3847,6 +3868,13 @@ func (h *GovernanceHandler) createModelConfig(ctx *fasthttp.RequestCtx) {
 			}
 			mc.Budgets = append(mc.Budgets, budget)
 		}
+		// VK-scoped model configs live on child rows; touch the owning VK row so
+		// VK-row change detection sees the change (see touchVirtualKeyTx).
+		if req.Scope == configstoreTables.ModelConfigScopeVirtualKey {
+			if err := touchVirtualKeyTx(tx, *req.ScopeID); err != nil {
+				return err
+			}
+		}
 		return nil
 	}); err != nil {
 		logger.Error("failed to create model config: %v", err)
@@ -3961,6 +3989,13 @@ func (h *GovernanceHandler) updateModelConfig(ctx *fasthttp.RequestCtx) {
 		if err := h.configStore.UpdateModelConfig(ctx, mc, tx); err != nil {
 			return err
 		}
+		// VK-scoped model configs live on child rows; touch the owning VK row so
+		// VK-row change detection sees the change (see touchVirtualKeyTx).
+		if mc.Scope == configstoreTables.ModelConfigScopeVirtualKey && mc.ScopeID != nil {
+			if err := touchVirtualKeyTx(tx, *mc.ScopeID); err != nil {
+				return err
+			}
+		}
 
 		// Now that the FK reference is removed, delete the orphaned rate limit.
 		if rateLimitIDToDelete != "" {
@@ -4007,7 +4042,7 @@ func (h *GovernanceHandler) updateModelConfig(ctx *fasthttp.RequestCtx) {
 func (h *GovernanceHandler) deleteModelConfig(ctx *fasthttp.RequestCtx) {
 	mcID := ctx.UserValue("mc_id").(string)
 	// Check if model config exists
-	_, err := h.configStore.GetModelConfigByID(ctx, mcID)
+	mc, err := h.configStore.GetModelConfigByID(ctx, mcID)
 	if err != nil {
 		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, 404, "Model config not found")
@@ -4016,8 +4051,17 @@ func (h *GovernanceHandler) deleteModelConfig(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, 500, "Failed to retrieve model config")
 		return
 	}
-	// Delete the model config
-	if err := h.configStore.DeleteModelConfig(ctx, mcID); err != nil {
+	// Delete the model config; for a VK-scoped config, touch the owning VK row
+	// in the same transaction so VK-row change detection sees the deletion.
+	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
+		if err := h.configStore.DeleteModelConfig(ctx, mcID, tx); err != nil {
+			return err
+		}
+		if mc.Scope == configstoreTables.ModelConfigScopeVirtualKey && mc.ScopeID != nil {
+			return touchVirtualKeyTx(tx, *mc.ScopeID)
+		}
+		return nil
+	}); err != nil {
 		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, 404, "Model config not found")
 			return

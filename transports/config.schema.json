@@ -2203,6 +2203,23 @@
       },
       "additionalProperties": false
     },
+    "config_sync": {
+      "type": "object",
+      "description": "Periodic DB-to-memory config reconcile for multi-node OSS deployments (enterprise builds converge via cluster gossip instead). Disabled unless enabled is true; reads updated_at change tokens from the config database and applies changed providers/keys/virtual keys to in-memory state without writing back.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the periodic reconcile worker runs. Default false."
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "Seconds between reconcile passes. Default 30."
+        }
+      },
+      "additionalProperties": false
+    },
     "skills_registry": {
       "type": "object",
       "description": "Declarative Skills Repository definitions reconciled from config.json",
