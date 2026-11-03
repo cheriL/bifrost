@@ -2580,6 +2580,68 @@ func TestConfigSchemaSourceOfTruthValidation(t *testing.T) {
 	require.Error(t, ValidateConfigSchema(invalid))
 }
 
+// TestLoadConfig_ConfigSyncBlockParses verifies the config_sync block survives
+// LoadConfig onto Config (where the config sync worker gates on it) and stays
+// nil when absent.
+func TestLoadConfig_ConfigSyncBlockParses(t *testing.T) {
+	initTestLogger()
+	ctx := context.Background()
+
+	enabled := true
+	interval := 45
+	withBlock := createTempDir(t)
+	createConfigFile(t, withBlock, &ConfigData{
+		ConfigSync: &ConfigSyncConfig{Enabled: &enabled, IntervalSeconds: &interval},
+	})
+	config, err := LoadConfig(ctx, withBlock)
+	if config != nil {
+		defer config.Close(ctx)
+	}
+	require.NoError(t, err)
+	require.NotNil(t, config.ConfigSync)
+	require.True(t, config.ConfigSync.IsEnabled())
+	require.Equal(t, 45*time.Second, config.ConfigSync.IntervalOrDefault())
+	require.False(t, config.IsConfigJSONSourceOfTruth())
+
+	withoutBlock := createTempDir(t)
+	createConfigFile(t, withoutBlock, &ConfigData{})
+	config2, err := LoadConfig(ctx, withoutBlock)
+	if config2 != nil {
+		defer config2.Close(ctx)
+	}
+	require.NoError(t, err)
+	require.Nil(t, config2.ConfigSync)
+	require.False(t, config2.ConfigSync.IsEnabled())
+}
+
+// TestLoadConfig_SourceOfTruthFlagExposed verifies the runtime flag the
+// config sync worker uses to stand down in config.json-authoritative mode.
+func TestLoadConfig_SourceOfTruthFlagExposed(t *testing.T) {
+	initTestLogger()
+	ctx := context.Background()
+
+	dir := createTempDir(t)
+	createConfigFile(t, dir, &ConfigData{SourceOfTruth: SourceOfTruthConfigJSON})
+	config, err := LoadConfig(ctx, dir)
+	if config != nil {
+		defer config.Close(ctx)
+	}
+	require.NoError(t, err)
+	require.True(t, config.IsConfigJSONSourceOfTruth())
+}
+
+// TestConfigSchemaConfigSyncValidation verifies config_sync is schema validated.
+func TestConfigSchemaConfigSyncValidation(t *testing.T) {
+	valid := []byte(`{"config_sync":{"enabled":true,"interval_seconds":45}}`)
+	require.NoError(t, ValidateConfigSchema(valid))
+
+	invalidField := []byte(`{"config_sync":{"enabled":true,"bogus":1}}`)
+	require.Error(t, ValidateConfigSchema(invalidField))
+
+	invalidInterval := []byte(`{"config_sync":{"enabled":true,"interval_seconds":0}}`)
+	require.Error(t, ValidateConfigSchema(invalidInterval))
+}
+
 // Test fixtures
 
 func makeClientConfig(initialPoolSize int, enableLogging bool) *configstore.ClientConfig {

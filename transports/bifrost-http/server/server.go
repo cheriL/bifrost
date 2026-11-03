@@ -242,6 +242,7 @@ type BifrostHTTPServer struct {
 	TempTokens           *temptoken.Service
 	TempTokenSweepWorker *temptoken.SweepWorker
 	OAuth2SweepWorker    *oauth2SweepWorker
+	ConfigSyncWorker     *configSyncWorker
 	// OAuth2IdentityResolver scopes a user-mode /mcp request to the user's own
 	// tools. Optional; wired at server init when user-mode identity resolution
 	// is available, otherwise left nil (user-mode requests fall back to the
@@ -809,6 +810,16 @@ func (s *BifrostHTTPServer) RemoveModelConfig(ctx context.Context, id string) er
 }
 
 func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas.ModelProvider) (*tables.TableProvider, error) {
+	return s.reloadProvider(ctx, provider, false)
+}
+
+// reloadProvider re-reads a provider from the config store and syncs governance
+// and the model catalog. skipUsageWriteback suppresses the usage write-back to
+// the database: the config sync worker sets it because in a multi-node
+// deployment each node's in-memory counters are authoritative for that node —
+// having every node write its own divergent values on reconcile would make the
+// DB usage columns oscillate (see server/configsync.go).
+func (s *BifrostHTTPServer) reloadProvider(ctx context.Context, provider schemas.ModelProvider, skipUsageWriteback bool) (*tables.TableProvider, error) {
 	if s.Config == nil || s.Config.ConfigStore == nil {
 		return nil, fmt.Errorf("config store not found")
 	}
@@ -842,14 +853,14 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 			}
 
 			// Sync updated usage values back to database if they changed
-			if updatedProvider.Budget != nil && providerInfo.Budget != nil {
+			if !skipUsageWriteback && updatedProvider.Budget != nil && providerInfo.Budget != nil {
 				if updatedProvider.Budget.CurrentUsage != providerInfo.Budget.CurrentUsage {
 					if err := s.Config.ConfigStore.UpdateBudgetUsage(ctx, updatedProvider.Budget.ID, updatedProvider.Budget.CurrentUsage); err != nil {
 						logger.Error("failed to sync budget usage to database: %v", err)
 					}
 				}
 			}
-			if updatedProvider.RateLimit != nil && providerInfo.RateLimit != nil {
+			if !skipUsageWriteback && updatedProvider.RateLimit != nil && providerInfo.RateLimit != nil {
 				tokenUsageChanged := updatedProvider.RateLimit.TokenCurrentUsage != providerInfo.RateLimit.TokenCurrentUsage
 				requestUsageChanged := updatedProvider.RateLimit.RequestCurrentUsage != providerInfo.RateLimit.RequestCurrentUsage
 				if tokenUsageChanged || requestUsageChanged {
@@ -924,11 +935,18 @@ func (s *BifrostHTTPServer) RemoveProvider(ctx context.Context, provider schemas
 		logger.Error("failed to remove provider from config: %v. Client and config may be out of sync, please restart bifrost", err)
 		return fmt.Errorf("failed to remove provider from config: %w. Client and config may be out of sync, please restart bifrost", err)
 	}
-	governancePlugin, err := s.getGovernancePlugin()
-	if err != nil {
-		return err
+	// Governance cleanup only runs when the plugin is loaded: provider removal
+	// itself is not a governance operation, and returning an error here would
+	// report a completed removal as failed — the API handler path surfaces it
+	// to the caller, and the config sync worker would retry the delete forever.
+	// Mirrors the IsPluginLoaded guard in reloadProvider.
+	if s.Config.IsPluginLoaded(s.getGovernancePluginName()) {
+		governancePlugin, err := s.getGovernancePlugin()
+		if err != nil {
+			return err
+		}
+		governancePlugin.GetGovernanceStore().DeleteProviderInMemory(ctx, string(provider))
 	}
-	governancePlugin.GetGovernanceStore().DeleteProviderInMemory(ctx, string(provider))
 	if s.Config == nil || s.Config.ModelCatalog == nil {
 		return fmt.Errorf("pricing manager not found")
 	}
@@ -2610,6 +2628,15 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 			s.TempTokenSweepWorker.Start(s.Ctx)
 		}
 		s.StartOAuth2SweepWorker(s.Ctx, nil)
+		// Periodic DB→memory config reconcile for multi-node OSS deployments.
+		// Enterprise builds converge via cluster gossip instead — the ctx key is
+		// set by the enterprise layer and gates this off.
+		if s.Ctx.Value(schemas.BifrostContextKeyIsEnterprise) == nil {
+			s.ConfigSyncWorker = newConfigSyncWorker(s)
+			if s.ConfigSyncWorker != nil {
+				s.ConfigSyncWorker.start(s.Ctx)
+			}
+		}
 		// Hand the service to the OAuth provider so InitiateUserOAuthFlow mints
 		// a mcp_auth token and embeds it as a URL fragment on the auth-page link.
 		if s.Config.OAuthProvider != nil {
@@ -2631,6 +2658,10 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 			if s.OAuth2SweepWorker != nil {
 				s.OAuth2SweepWorker.stop()
 				s.OAuth2SweepWorker = nil
+			}
+			if s.ConfigSyncWorker != nil {
+				s.ConfigSyncWorker.stop()
+				s.ConfigSyncWorker = nil
 			}
 			return fmt.Errorf("failed to initialize auth middleware: %v", err)
 		}
@@ -2663,6 +2694,10 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		if s.OAuth2SweepWorker != nil {
 			s.OAuth2SweepWorker.stop()
 			s.OAuth2SweepWorker = nil
+		}
+		if s.ConfigSyncWorker != nil {
+			s.ConfigSyncWorker.stop()
+			s.ConfigSyncWorker = nil
 		}
 		return fmt.Errorf("failed to initialize routes: %v", err)
 	}
@@ -2707,6 +2742,10 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		if s.OAuth2SweepWorker != nil {
 			s.OAuth2SweepWorker.stop()
 			s.OAuth2SweepWorker = nil
+		}
+		if s.ConfigSyncWorker != nil {
+			s.ConfigSyncWorker.stop()
+			s.ConfigSyncWorker = nil
 		}
 		return fmt.Errorf("failed to initialize inference routes: %v", err)
 	}
@@ -2881,6 +2920,11 @@ func (s *BifrostHTTPServer) Start() error {
 				logger.Info("stopping oauth2 sweep worker...")
 				s.OAuth2SweepWorker.stop()
 				s.OAuth2SweepWorker = nil
+			}
+			if s.ConfigSyncWorker != nil {
+				logger.Info("stopping config sync worker...")
+				s.ConfigSyncWorker.stop()
+				s.ConfigSyncWorker = nil
 			}
 			if s.SidekiqDispatcherStop != nil {
 				logger.Info("stopping sidekiq dispatcher...")

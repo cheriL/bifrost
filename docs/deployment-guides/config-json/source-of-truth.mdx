@@ -105,6 +105,33 @@ Before using `source_of_truth: "config.json"` in production, check whether your 
 
 ---
 
+## Runtime DB-to-Memory Reconcile (Multi-Node OSS)
+
+`source_of_truth` governs **startup** reconciliation between `config.json` and the config store. A separate concern is **runtime** convergence between nodes: on OSS multi-node deployments, config edited through one node's API (providers, provider keys, virtual keys) is persisted to the shared config store but other nodes keep serving from their in-memory snapshot until they restart. Enterprise builds close this gap with cluster gossip; the `config_sync` block is the opt-in OSS equivalent:
+
+```json
+{
+  "config_sync": {
+    "enabled": true,
+    "interval_seconds": 30
+  }
+}
+```
+
+How it works:
+
+- Every `interval_seconds`, the node probes `updated_at` change tokens for providers, provider keys, and virtual keys, and re-applies only what changed — through the same mutation paths the API uses, without writing back to the database.
+- The worker never runs in enterprise builds (cluster gossip owns convergence), with `config_store.enabled: false` (no shared database), or under `source_of_truth: "config.json"` (authoritative file sync owns reconciliation).
+- Usage counters (budget spend, rate-limit windows) are **not** synchronized: each node enforces from its own counters, which is unchanged OSS behavior. Budget enforcement across nodes remains per-node approximate.
+
+Accepted behaviors when enabled:
+
+- A node restart bumps every provider's change token (startup re-persists all providers), so peers re-apply all providers once per restart.
+- Config edited through a node's API is re-applied once on that same node's next tick — one redundant in-memory refresh, no functional effect.
+- Writes made directly to the config database converge to every node within one interval. Treat direct DB writes as privileged configuration changes.
+
+---
+
 ## Recommended Use
 
 | Goal | Recommended setup |
@@ -112,6 +139,7 @@ Before using `source_of_truth: "config.json"` in production, check whether your 
 | Interactive single-node gateway | Omit `config.json`, or use `config.json` with a config store and default `split` mode |
 | Bootstrap from file, then allow UI/API edits | DB-backed config store, explicit or default, with `source_of_truth: "split"` |
 | Strict GitOps over selected sections | DB-backed config store, explicit or default, plus `source_of_truth: "config.json"` and only the sections you intend to own |
-| File-only OSS multinode deployment | `config_store.enabled: false` with a shared `config.json` |
+| DB-backed OSS multinode deployment | Shared config store with `config_sync.enabled: true` so peer nodes pick up API edits within one interval |
+| File-only OSS multinode deployment | `config_store.enabled: false` with a shared `config.json` (changes require a coordinated restart) |
 
 For DB-backed deployments, prefer `split` unless you explicitly want restarts to revert UI/API changes back to `config.json`.
